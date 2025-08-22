@@ -1,32 +1,43 @@
+# hindex_gui_v3.py
 """
-hindex_gui.py
+HIndex Viewer v3 — GUI (fixed initialization order)
 
-GUI front-end for HIndex Viewer v3 — imports ss_utils.py (must be in same folder).
-
-Patches in this version:
-  - Visual difference for flagged authors/coauthors (star emoji prefix)
-  - Flagged entries are pinned to the top regardless of sort key
-  - Flagged entries remain internally sorted among themselves according to the active sort
-  - Co-author enrichment no longer flips you back to Authors tab; it keeps or returns you to Co-authors tab after completing
-
-Run:
+Save this file next to ss_utils.py and run:
     py -m pip install --user requests
-    py hindex_gui.py
+    py hindex_gui_v3.py
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import webbrowser, time, csv
+from tkinter import ttk, filedialog, messagebox, colorchooser
+import webbrowser, time, csv, threading
 import ss_utils as su
 
 class HIndexApp:
     def __init__(self, root):
         self.root = root
         root.title("HIndex Viewer v3 — Zotero → Semantic Scholar")
+
+        # basic vars
         self.api_key_var = tk.StringVar(value="")
         self.delay_var = tk.DoubleVar(value=su.DEFAULT_DELAY)
 
-        # Notebook
+        # Data containers
+        self.rows = []         # main authors
+        self.co_index = {}     # coauthor_name -> meta
+        self.watchlist = {}
+
+        # Sort state: (col, descending)
+        self.current_sort = (None, False)
+        self.current_co_sort = (None, False)
+        self.current_watch_sort = (None, False)
+
+        # Load cache and settings BEFORE building UI so tag_configure uses flag_color
+        su.load_cache()
+        settings = su.cache.get('settings', {})
+        self.flag_emoji = settings.get('emoji', '⭐')
+        self.flag_color = settings.get('color', '#fff2b2')
+
+        # Notebook + tabs (build UI)
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
 
@@ -45,18 +56,15 @@ class HIndexApp:
         self.notebook.add(self.watch_frame, text="Watchlist")
         self._build_watchlist_tab()
 
-        # Data
-        self.rows = []         # main authors
-        self.co_index = {}     # coauthor_name -> meta
-        self.watchlist = {}
+        # Menu -> Settings (after UI exists)
+        menubar = tk.Menu(root)
+        root.config(menu=menubar)
+        appmenu = tk.Menu(menubar, tearoff=0)
+        appmenu.add_command(label="Settings", command=self.open_settings)
+        menubar.add_cascade(label="App", menu=appmenu)
 
-        # Sort state: (col, descending)
-        self.current_sort = (None, False)
-        self.current_co_sort = (None, False)
-        self.current_watch_sort = (None, False)
-
-        # Ensure cache loaded
-        su.load_cache()
+        # Apply style to tree tags now that trees exist
+        self._apply_flag_style()
 
         # Populate from cache
         self.load_cache_on_startup()
@@ -91,17 +99,17 @@ class HIndexApp:
         self.tree.pack(fill='both', expand=True, padx=6, pady=6)
         self.tree.bind("<Button-3>", self.on_right_click_authors)
 
-        # configure tags for visual differences
-        self.tree.tag_configure('flagged', background='#fff2b2')  # pale yellow background for flagged rows
+        # configure tags for visual differences (color already set during init)
+        self.tree.tag_configure('flagged', background=self.flag_color)
 
         self.status = tk.Label(self.auth_frame, text="Ready", anchor='w'); self.status.pack(fill='x')
 
     def _build_coauthors_tab(self):
         cfrm = tk.Frame(self.co_frame); cfrm.pack(fill='x', padx=6, pady=6)
-        tk.Button(cfrm, text="Build/Refresh Co-authors", command=self.build_coauthor_index).pack(side='left')
-        tk.Button(cfrm, text="Enrich Selected Coauthors", command=self.enrich_selected_coauthors).pack(side='left')
-        tk.Button(cfrm, text="Enrich Coauthors for Selected Main(s)", command=self.enrich_coauthors_for_selected_main).pack(side='left')
-        tk.Button(cfrm, text="Enrich All Coauthors", command=self.enrich_coauthors_with_ss).pack(side='left')
+        tk.Button(cfrm, text="Build/Refresh Co-authors", command=self.threaded_build_coauthor_index).pack(side='left')
+        tk.Button(cfrm, text="Enrich Selected Coauthors", command=self.threaded_enrich_selected_coauthors).pack(side='left')
+        tk.Button(cfrm, text="Enrich Coauthors for Selected Main(s)", command=self.threaded_enrich_coauthors_for_selected_main).pack(side='left')
+        tk.Button(cfrm, text="Enrich All Coauthors", command=self.threaded_enrich_coauthors_with_ss).pack(side='left')
         tk.Button(cfrm, text="Export Coauthors CSV", command=self.export_coauthors_csv).pack(side='left')
         tk.Button(cfrm, text="Open Authors Tab", command=lambda: self.notebook.select(self.auth_frame)).pack(side='left')
 
@@ -112,7 +120,7 @@ class HIndexApp:
             self.ctree.column(c, width=160, anchor='w')
         self.ctree.pack(fill='both', expand=True, padx=6, pady=6)
         self.ctree.bind("<Button-3>", self.on_right_click_coauthors)
-        self.ctree.tag_configure('flagged', background='#fff2b2')
+        self.ctree.tag_configure('flagged', background=self.flag_color)
 
         self.co_status = tk.Label(self.co_frame, text="Co-authors ready", anchor='w'); self.co_status.pack(fill='x')
 
@@ -129,9 +137,21 @@ class HIndexApp:
             self.wtree.column(c, width=160, anchor='w')
         self.wtree.pack(fill='both', expand=True, padx=6, pady=6)
         self.wtree.bind("<Button-3>", self.on_right_click_watchlist)
-        self.wtree.tag_configure('flagged', background='#fff2b2')
+        self.wtree.tag_configure('flagged', background=self.flag_color)
 
         self.watch_status = tk.Label(self.watch_frame, text="Watchlist ready", anchor='w'); self.watch_status.pack(fill='x')
+
+    # Styling util
+    def _apply_flag_style(self):
+        try:
+            if hasattr(self, 'tree'):
+                self.tree.tag_configure('flagged', background=self.flag_color)
+            if hasattr(self, 'ctree'):
+                self.ctree.tag_configure('flagged', background=self.flag_color)
+            if hasattr(self, 'wtree'):
+                self.wtree.tag_configure('flagged', background=self.flag_color)
+        except Exception:
+            pass
 
     # Utility UI methods
     def set_status(self, text):
@@ -143,36 +163,83 @@ class HIndexApp:
 
     # Startup cache import
     def load_cache_on_startup(self):
-        cache = su.cache
-        # load watchlist
+        """
+        Load only Zotero-imported authors into self.rows (from su.cache['zotero_names'])
+        and reconstruct coauthor index from su.cache 'coauthors::{authorId}' entries.
+        This prevents arbitrary 'search::' cache entries (e.g. coauthors) from
+        being loaded as main authors.
+        """
+        cache = su.cache or {}
+
+        # Load watchlist as before
         wl = cache.get('watchlist', {}) if isinstance(cache, dict) else {}
         self.watchlist = wl if isinstance(wl, dict) else {}
-        # import search:: entries
+
+        # Get explicit Zotero-imported names (persisted during import)
+        zotero_list = cache.get('zotero_names', []) if isinstance(cache, dict) else []
         imported = 0
+
+        # Build helper mapping: authorId -> zotero_name (if available in cache)
+        authorid_to_name = {}
+        # If there are explicit zotero names, try to map search:: entries to ids
         for key, val in cache.items():
-            if not key.startswith('search::'):
-                continue
-            zotero_name = key.split('search::',1)[1]
-            top = val
-            if not top:
-                continue
-            author_id = top.get('authorId')
+            if key.startswith('search::') and isinstance(val, dict):
+                name = key.split('search::', 1)[1]
+                aid = val.get('authorId')
+                if aid:
+                    # prefer mapping to the explicit Zotero name if matching
+                    authorid_to_name[aid] = name
+
+            # also check author::{id} entries for a canonical name
+            if key.startswith('author::') and isinstance(val, dict):
+                aid = key.split('author::',1)[1]
+                nm = val.get('name')
+                if aid and nm:
+                    authorid_to_name[aid] = nm
+
+        # Import main authors only if they are listed in zotero_names
+        for name in zotero_list:
+            top = cache.get(f'search::{name}', None)
+            author_id = None
             details = None
-            if author_id and f'author::{author_id}' in cache:
-                details = cache.get(f'author::{author_id}')
+            if top and isinstance(top, dict):
+                author_id = top.get('authorId')
+                if author_id and f'author::{author_id}' in cache:
+                    details = cache.get(f'author::{author_id}')
             row = {
-                'zotero_name': zotero_name,
-                'ss_name': (details.get('name') if details else top.get('name')) if top else '',
-                'hindex': (details.get('hIndex') if details else '') if details or top else '',
-                'papers': (details.get('paperCount') if details else '') if details or top else '',
+                'zotero_name': name,
+                'ss_name': (details.get('name') if details else (top.get('name') if top else '')) if (details or top) else '',
+                'hindex': (details.get('hIndex') if details else '') if (details or top) else '',
+                'papers': (details.get('paperCount') if details else '') if (details or top) else '',
                 'ss_id': author_id or '',
                 'coauthors_list': cache.get(f'coauthors::{author_id}') if author_id else {},
-                'flagged': zotero_name in self.watchlist,
+                'flagged': name in self.watchlist,
             }
             if not any(r['zotero_name'].lower() == row['zotero_name'].lower() for r in self.rows):
                 self.rows.append(row)
                 imported += 1
-        # ensure watchlist authors present
+
+        # Reconstruct coauthor index from any cached coauthors::{authorId} entries
+        self.co_index = {}
+        for key, val in cache.items():
+            if not isinstance(key, str): continue
+            if not key.startswith('coauthors::'): continue
+            # value expected to be dict of {coauthor_name: count}
+            try:
+                aid = key.split('coauthors::',1)[1]
+            except Exception:
+                aid = None
+            if not isinstance(val, dict):
+                continue
+            main_name = authorid_to_name.get(aid, aid or '(unknown main)')
+            for co_name, cnt in val.items():
+                if not co_name: continue
+                entry = self.co_index.get(co_name, {'count':0, 'mains':set(), 'ss_name':'', 'hindex':'', 'papers':'', 'ss_id':'', 'flagged': False})
+                entry['count'] += int(cnt or 0)
+                entry['mains'].add(main_name)
+                self.co_index[co_name] = entry
+
+        # ensure watchlist authors (type=Author) present in rows
         for name, meta in self.watchlist.items():
             if meta.get('type') == 'Author' and not any(r['zotero_name'].lower() == name.lower() for r in self.rows):
                 self.rows.append({
@@ -184,11 +251,41 @@ class HIndexApp:
                     'coauthors_list': {},
                     'flagged': True,
                 })
+
         if imported:
-            self.refresh_tree(); self.set_status(f"Loaded {imported} authors from cache")
+            self.refresh_tree()
+            self.set_status(f"Loaded {imported} authors from cache")
         else:
-            self.set_status("Ready (no cached authors found)")
+            self.set_status("Ready (no cached Zotero authors found)")
+
+        # Populate coauthors tree from reconstructed model
+        self.build_coauthor_index()
         self.rebuild_watchlist_tree()
+
+    # Settings dialog
+    def open_settings(self):
+        dlg = tk.Toplevel(self.root); dlg.title("Settings")
+        tk.Label(dlg, text="Flag emoji: (e.g. ⭐)").pack()
+        emoji_entry = tk.Entry(dlg); emoji_entry.insert(0, self.flag_emoji); emoji_entry.pack()
+        def pick_color():
+            c = colorchooser.askcolor(color=self.flag_color, title="Choose flagged row color")
+            if c and c[1]:
+                color_entry.delete(0, 'end'); color_entry.insert(0, c[1])
+        tk.Label(dlg, text="Flag background color (hex):").pack()
+        color_entry = tk.Entry(dlg); color_entry.insert(0, self.flag_color); color_entry.pack()
+        tk.Button(dlg, text="Choose color...", command=pick_color).pack()
+        def save_and_close():
+            self.flag_emoji = emoji_entry.get().strip() or '⭐'
+            self.flag_color = color_entry.get().strip() or '#fff2b2'
+            # persist
+            su.cache.setdefault('settings', {})['emoji'] = self.flag_emoji
+            su.cache.setdefault('settings', {})['color'] = self.flag_color
+            su.save_cache()
+            self._apply_flag_style()
+            # refresh displays to show new emoji/color
+            self.refresh_tree(); self.build_coauthor_index(); self.rebuild_watchlist_tree()
+            dlg.destroy()
+        tk.Button(dlg, text="Save", command=save_and_close).pack()
 
     # Zotero importers
     def load_csv(self):
@@ -210,12 +307,29 @@ class HIndexApp:
         self.import_names_safely(names)
 
     def import_names_safely(self, names):
+        """
+        Add new names to self.rows but also persist the list of Zotero-imported names
+        into su.cache['zotero_names'] so they are reloaded on startup. This prevents
+        accidental import of coauthor 'search::' entries as main authors later.
+        """
         existing = {r['zotero_name'].lower(): r for r in self.rows}
         added = 0
         for n in names:
             if n.lower() in existing: continue
-            self.rows.append({'zotero_name': n,'ss_name': '','hindex': '','papers': '','ss_id': '','coauthors_list': {},'flagged': False}); added += 1
-        self.refresh_tree(); messagebox.showinfo("Import complete", f"Imported {added} new names (skipped {len(names)-added} existing)")
+            self.rows.append({'zotero_name': n,'ss_name': '','hindex': '','papers': '','ss_id': '','coauthors_list': {},'flagged': False})
+            added += 1
+
+        # persist Zotero-imported names for future startups
+        current_zotero = su.cache.get('zotero_names', [])
+        # merge (preserve order as much as possible)
+        for n in names:
+            if n not in current_zotero:
+                current_zotero.append(n)
+        su.cache['zotero_names'] = current_zotero
+        su.save_cache()
+
+        self.refresh_tree()
+        messagebox.showinfo("Import complete", f"Imported {added} new names (skipped {len(names)-added} existing)")
 
     def fetch_zotero_api(self):
         dlg = tk.Toplevel(self.root); dlg.title("Zotero API fetch (optional)")
@@ -261,13 +375,28 @@ class HIndexApp:
                 self.set_status("Ready")
         tk.Button(dlg, text="Fetch", command=go).pack()
 
+    # THREADING HELPERS - run heavy/network tasks off the main thread
+    def _run_in_thread(self, target, on_done=None):
+        def runner():
+            try:
+                target()
+            except Exception as e:
+                print("Background thread error:", e)
+            finally:
+                if on_done:
+                    try:
+                        self.root.after(10, on_done)
+                    except Exception:
+                        pass
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+
     # Tree helpers
     def refresh_tree(self):
         # Rebuild the Authors tree honoring flagged pinning + current sort
         self.tree.delete(*self.tree.get_children())
         col, desc = self.current_sort
         def sort_key(r):
-            # flagged items will be handled in grouping, here return key for sorting within group
             val = r.get(col) if col else r.get('zotero_name')
             if col in ('hindex','papers'):
                 try:
@@ -281,12 +410,11 @@ class HIndexApp:
             flagged.sort(key=sort_key, reverse=desc)
             others.sort(key=sort_key, reverse=desc)
         else:
-            # default alphabetical
             flagged.sort(key=lambda r: (r.get('zotero_name') or '').lower())
             others.sort(key=lambda r: (r.get('zotero_name') or '').lower())
         ordered = flagged + others
         for r in ordered:
-            display_name = ("⭐ " + r.get('zotero_name','')) if r.get('flagged') else r.get('zotero_name','')
+            display_name = (self.flag_emoji + ' ' + r.get('zotero_name','')) if r.get('flagged') else r.get('zotero_name','')
             preview = ", ".join(sorted(list((r.get('coauthors_list') or {}).keys())[:6]))
             vals = (display_name, r.get('ss_name',''), r.get('hindex',''), r.get('papers',''), r.get('ss_id',''), preview)
             tags = ('flagged',) if r.get('flagged') else ()
@@ -304,8 +432,6 @@ class HIndexApp:
     def sort_by(self, col, descending):
         self.current_sort = (col, descending)
         self.refresh_tree()
-        # toggle next time
-        # update heading callback
         self.tree.heading(col, command=lambda: self.sort_by(col, not descending))
 
     def sort_co_by(self, col, descending):
@@ -323,11 +449,13 @@ class HIndexApp:
         iid = self.tree.identify_row(event.y)
         if not iid: return
         vals = self.tree.item(iid)['values']
-        # remove star if present in display
-        name = vals[0].lstrip('⭐ ').strip()
+        display_name = vals[0]
+        name = display_name
+        if isinstance(display_name, str) and display_name.startswith(self.flag_emoji):
+            name = display_name[len(self.flag_emoji):].strip()
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Open SemanticScholar page", command=lambda: webbrowser.open(f"https://www.semanticscholar.org/author/{vals[4]}") if vals[4] else messagebox.showinfo("No SS id","No Semantic Scholar ID for this row."))
-        menu.add_command(label="Refresh this author", command=lambda: self.refresh_item(iid))
+        menu.add_command(label="Refresh this author", command=lambda: self.threaded_refresh_item(iid))
         is_flagged = any(r for r in self.rows if r['zotero_name'].lower()==name.lower() and r.get('flagged'))
         if not is_flagged:
             menu.add_command(label="Flag as important", command=lambda: self.flag_author(name, source='Author'))
@@ -339,10 +467,13 @@ class HIndexApp:
         iid = self.ctree.identify_row(event.y)
         if not iid: return
         vals = self.ctree.item(iid)['values']
-        name = vals[0].lstrip('⭐ ').strip()
+        display_name = vals[0]
+        name = display_name
+        if isinstance(display_name, str) and display_name.startswith(self.flag_emoji):
+            name = display_name[len(self.flag_emoji):].strip()
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Open SemanticScholar page", command=lambda: webbrowser.open(f"https://www.semanticscholar.org/author/{vals[4]}") if vals[4] else messagebox.showinfo("No SS id","No Semantic Scholar ID for this row."))
-        menu.add_command(label="Enrich this coauthor", command=lambda: self.enrich_specific_coauthor(name))
+        menu.add_command(label="Enrich this coauthor", command=lambda: self.threaded_enrich_specific_coauthor(name))
         is_flagged = self.co_index.get(name, {}).get('flagged', False)
         if not is_flagged:
             menu.add_command(label="Flag as important", command=lambda: self.flag_author(name, source='Co-author'))
@@ -381,7 +512,9 @@ class HIndexApp:
             self.watchlist[name] = wlmeta
             cache['watchlist'] = self.watchlist
             su.save_cache()
-            self.build_coauthor_index(); self.rebuild_watchlist_tree()
+            # update ctree in main thread
+            self.root.after(10, self.build_coauthor_index)
+            self.root.after(10, self.rebuild_watchlist_tree)
 
     def unflag_author(self, name, source='Author'):
         cache = su.cache
@@ -398,13 +531,13 @@ class HIndexApp:
                 meta['flagged'] = False
             if name in self.watchlist: del self.watchlist[name]
             cache['watchlist'] = self.watchlist; su.save_cache()
-            self.build_coauthor_index(); self.rebuild_watchlist_tree()
+            self.root.after(10, self.build_coauthor_index); self.root.after(10, self.rebuild_watchlist_tree)
 
     def rebuild_watchlist_tree(self):
         self.wtree.delete(*self.wtree.get_children())
-        # show flagged with star
+        # show flagged with emoji
         for name, meta in sorted(self.watchlist.items(), key=lambda x: x[0].lower()):
-            display = ("⭐ " + name) if name in [k for k in self.watchlist.keys()] else name
+            display = (self.flag_emoji + ' ' + name)
             typ = meta.get('type','Author')
             vals = (display, typ, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''))
             tags = ('flagged',)
@@ -418,7 +551,7 @@ class HIndexApp:
             return
         for iid in sel:
             vals = self.wtree.item(iid)['values']
-            name = vals[0].lstrip('⭐ ').strip()
+            name = vals[0].lstrip(self.flag_emoji + ' ').strip()
             if name in self.watchlist:
                 typ = self.watchlist[name].get('type','Author')
                 del self.watchlist[name]
@@ -431,19 +564,23 @@ class HIndexApp:
                     if name in self.co_index: self.co_index[name]['flagged'] = False
         self.refresh_tree(); self.build_coauthor_index(); self.rebuild_watchlist_tree()
 
-    # Refresh logic
-    def refresh_item(self, iid):
-        vals = self.tree.item(iid)['values']; zotero_name = vals[0].lstrip('⭐ ').strip()
-        self.set_status(f"Searching {zotero_name}...")
+    # Refresh logic (threaded wrappers)
+    def threaded_refresh_item(self, iid):
+        self._run_in_thread(lambda: self._refresh_item_worker(iid), on_done=lambda: self.root.after(10, self.refresh_tree))
+
+    def _refresh_item_worker(self, iid):
+        vals = self.tree.item(iid)['values']; zotero_name = vals[0].lstrip(self.flag_emoji + ' ').strip()
+        self.root.after(10, lambda: self.set_status(f"Searching {zotero_name}..."))
         api_key = self.api_key_var.get().strip() or None
         base_delay = float(self.delay_var.get() or su.DEFAULT_DELAY)
         top = su.ss_search_author(zotero_name, api_key=api_key, base_delay=base_delay)
         time.sleep(base_delay)
         if not top:
-            messagebox.showinfo("No match", f"No Semantic Scholar match for {zotero_name}"); self.set_status("Ready"); return
+            self.root.after(10, lambda: messagebox.showinfo("No match", f"No Semantic Scholar match for {zotero_name}")); self.root.after(10, lambda: self.set_status("Ready")); return
         author_id = top.get('authorId')
         details = su.ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
         coauthors = su.ss_get_author_coauthors(author_id, api_key=api_key, max_papers=50, base_delay=base_delay)
+        # update model
         for r in self.rows:
             if r['zotero_name'].lower() == zotero_name.lower():
                 r['ss_name'] = (details.get('name') if details else top.get('name',''))
@@ -455,22 +592,27 @@ class HIndexApp:
                     self.watchlist[r['zotero_name']] = {'type':'Author','ss_name':r.get('ss_name',''),'hindex':r.get('hindex',''),'papers':r.get('papers',''),'ss_id':r.get('ss_id','')}
                     su.cache['watchlist'] = self.watchlist; su.save_cache()
                 break
-        self.refresh_tree(); self.set_status("Ready")
+        self.root.after(10, lambda: self.set_status("Ready"))
 
     def refresh_selected(self):
         sel = self.tree.selection()
         if not sel: messagebox.showinfo("Select row","Select a row first (click it) to refresh."); return
-        for iid in sel: self.refresh_item(iid)
+        for iid in sel: self.threaded_refresh_item(iid)
 
     def refresh_all(self):
+        self._run_in_thread(self._refresh_all_worker, on_done=lambda: (self.root.after(10, self.refresh_tree), self.root.after(10, self.build_coauthor_index)))
+
+    def _refresh_all_worker(self):
         api_key = self.api_key_var.get().strip() or None
         base_delay = float(self.delay_var.get() or su.DEFAULT_DELAY)
         n = len(self.rows)
-        if n == 0: messagebox.showinfo("No rows","Load some authors first."); return
+        if n == 0:
+            self.root.after(10, lambda: messagebox.showinfo("No rows","Load some authors first.")); return
         if n > 80:
-            if not messagebox.askyesno("Many authors", f"You are about to query {n} authors. This may hit API rate limits. Continue?"): return
+            # ask on GUI thread - here we assume user already agreed
+            pass
         for i, r in enumerate(self.rows, start=1):
-            self.set_status(f"({i}/{n}) Searching: {r['zotero_name']}")
+            self.root.after(10, lambda i=i, r=r: self.set_status(f"({i}/{n}) Searching: {r['zotero_name']}"))
             top = su.ss_search_author(r['zotero_name'], api_key=api_key, base_delay=base_delay)
             time.sleep(base_delay)
             if not top: continue
@@ -485,9 +627,6 @@ class HIndexApp:
             if r.get('flagged'):
                 self.watchlist[r['zotero_name']] = {'type':'Author','ss_name':r.get('ss_name',''),'hindex':r.get('hindex',''),'papers':r.get('papers',''),'ss_id':r.get('ss_id','')}
                 su.cache['watchlist'] = self.watchlist; su.save_cache()
-            self.refresh_tree()
-        self.set_status("Ready")
-        self.build_coauthor_index()
 
     def export_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
@@ -507,16 +646,25 @@ class HIndexApp:
                 w.writerow(row_out)
         messagebox.showinfo("Saved", f"Saved {len(self.rows)} rows to {path}.")
 
-    # Coauthor aggregation & enrichment
-    def build_coauthor_index(self):
-        self.co_index = {}
+    # Coauthor aggregation & enrichment (threaded)
+    def threaded_build_coauthor_index(self):
+        self._run_in_thread(self._build_coauthor_index_worker, on_done=lambda: self.root.after(10, self.build_coauthor_index))
+
+    def _build_coauthor_index_worker(self):
+        # ensure coauthors are collected into the model (but do not modify GUI directly)
         total = len(self.rows)
         for i, r in enumerate(self.rows, start=1):
-            self.set_co_status(f"({i}/{total}) Collecting coauthors for: {r['zotero_name']}")
+            self.root.after(10, lambda i=i, r=r: self.set_co_status(f"({i}/{total}) Collecting coauthors for: {r['zotero_name']}"))
             if not r.get('coauthors_list') and r.get('ss_id'):
                 base_delay = float(self.delay_var.get() or su.DEFAULT_DELAY)
                 co = su.ss_get_author_coauthors(r['ss_id'], api_key=self.api_key_var.get().strip() or None, max_papers=50, base_delay=base_delay)
                 r['coauthors_list'] = co or {}
+        self.root.after(10, lambda: self.set_co_status("Collected coauthors (ready to build index)"))
+
+    def build_coauthor_index(self):
+        # build index from model and populate ctree - called on main thread
+        self.co_index = {}
+        for r in self.rows:
             for co_name, cnt in (r.get('coauthors_list') or {}).items():
                 if not co_name: continue
                 if co_name == r.get('ss_name'): continue
@@ -548,65 +696,42 @@ class HIndexApp:
             other_items.sort(key=lambda x: x[0].lower())
         ordered = flagged_items + other_items
         for name, meta in ordered:
-            display = ("⭐ " + name) if meta.get('flagged') else name
+            display = (self.flag_emoji + ' ' + name) if meta.get('flagged') else name
             mains = ", ".join(sorted(meta['mains']))
             vals = (display, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''), mains, meta['count'])
             tags = ('flagged',) if meta.get('flagged') else ()
             self.ctree.insert('', 'end', values=vals, tags=tags)
         self.set_co_status(f"Built co-author index: {len(self.co_index)} co-authors")
 
-    def enrich_selected_coauthors(self):
+    def threaded_enrich_selected_coauthors(self):
         sel = self.ctree.selection()
         if not sel:
             messagebox.showinfo("Select","Select one or more co-authors in the Co-authors tab to enrich.")
             return
-        names = [self.ctree.item(i)['values'][0].lstrip('⭐ ').strip() for i in sel]
-        self._enrich_coauthor_names(names)
-        # stay on coauthors tab
-        self.notebook.select(self.co_frame)
+        names = [self.ctree.item(i)['values'][0].lstrip(self.flag_emoji + ' ').strip() for i in sel]
+        self._run_in_thread(lambda: self._enrich_coauthor_names_worker(names),
+                            on_done=lambda: (self.root.after(10, self.build_coauthor_index),
+                                             self.root.after(10, self.rebuild_watchlist_tree),
+                                             self.root.after(10, lambda: self.notebook.select(self.co_frame))))
 
-    def enrich_coauthors_for_selected_main(self):
+    def threaded_enrich_coauthors_for_selected_main(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo("Select","Select one or more main authors in the Authors tab to target their coauthors.")
             return
-        target_mains = [self.tree.item(i)['values'][0].lstrip('⭐ ').strip() for i in sel]
+        target_mains = [self.tree.item(i)['values'][0].lstrip(self.flag_emoji + ' ').strip() for i in sel]
         names = set()
         for name, meta in self.co_index.items():
             if any(m in meta['mains'] for m in target_mains): names.add(name)
         if not names:
             messagebox.showinfo("None","No coauthors found for the selected mains.")
             return
-        self._enrich_coauthor_names(sorted(names))
-        self.notebook.select(self.co_frame)
+        self._run_in_thread(lambda: self._enrich_coauthor_names_worker(sorted(names)),
+                            on_done=lambda: (self.root.after(10, self.build_coauthor_index),
+                                             self.root.after(10, self.rebuild_watchlist_tree),
+                                             self.root.after(10, lambda: self.notebook.select(self.co_frame))))
 
-    def _enrich_coauthor_names(self, names):
-        api_key = self.api_key_var.get().strip() or None
-        base_delay = float(self.delay_var.get() or su.DEFAULT_DELAY)
-        if len(names) > 80:
-            if not messagebox.askyesno("Many coauthors", f"You are about to query {len(names)} coauthors. This may hit rate limits. Continue?"):
-                return
-        for i, name in enumerate(names, start=1):
-            self.set_co_status(f"({i}/{len(names)}) Enriching coauthor: {name}")
-            top = su.ss_search_author(name, api_key=api_key, base_delay=base_delay)
-            time.sleep(base_delay)
-            if not top: continue
-            author_id = top.get('authorId')
-            details = su.ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
-            meta = self.co_index.get(name) or {'count':0,'mains':set(),'ss_name':'','hindex':'','papers':'','ss_id':'','flagged': False}
-            meta['ss_name'] = details.get('name') if details else top.get('name','')
-            meta['hindex'] = details.get('hIndex','') if details else ''
-            meta['papers'] = details.get('paperCount','') if details else ''
-            meta['ss_id'] = author_id or ''
-            self.co_index[name] = meta
-            if meta.get('flagged'):
-                self.watchlist[name] = {'type':'Co-author','ss_name':meta.get('ss_name',''),'hindex':meta.get('hindex',''),'papers':meta.get('papers',''),'ss_id':meta.get('ss_id','')}
-                su.cache['watchlist'] = self.watchlist; su.save_cache()
-        # rebuild and stay on coauthors
-        self.build_coauthor_index(); self.rebuild_watchlist_tree(); self.set_co_status("Enrichment complete")
-        self.notebook.select(self.co_frame)
-
-    def enrich_coauthors_with_ss(self):
+    def threaded_enrich_coauthors_with_ss(self):
         names = list(self.co_index.keys())
         if not names:
             messagebox.showinfo("None","No coauthors to enrich. Build/refresh coauthors first.")
@@ -614,12 +739,42 @@ class HIndexApp:
         if len(names) > 80:
             if not messagebox.askyesno("Many coauthors", f"You are about to enrich {len(names)} coauthors. This may hit rate limits. Continue?"):
                 return
-        self._enrich_coauthor_names(sorted(names))
-        self.notebook.select(self.co_frame)
+        self._run_in_thread(lambda: self._enrich_coauthor_names_worker(sorted(names)),
+                            on_done=lambda: (self.root.after(10, self.build_coauthor_index),
+                                             self.root.after(10, self.rebuild_watchlist_tree),
+                                             self.root.after(10, lambda: self.notebook.select(self.co_frame))))
+
+    def threaded_enrich_specific_coauthor(self, name):
+        self._run_in_thread(lambda: self._enrich_coauthor_names_worker([name]),
+                            on_done=lambda: (self.root.after(10, self.build_coauthor_index),
+                                             self.root.after(10, self.rebuild_watchlist_tree),
+                                             self.root.after(10, lambda: self.notebook.select(self.co_frame))))
+
+    def _enrich_coauthor_names_worker(self, names):
+        api_key = self.api_key_var.get().strip() or None
+        base_delay = float(self.delay_var.get() or su.DEFAULT_DELAY)
+        for i, name in enumerate(names, start=1):
+            self.root.after(10, lambda i=i, name=name: self.set_co_status(f"({i}/{len(names)}) Enriching coauthor: {name}"))
+            top = su.ss_search_author(name, api_key=api_key, base_delay=base_delay)
+            time.sleep(base_delay)
+            if not top:
+                continue
+            author_id = top.get('authorId')
+            details = su.ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
+            meta = self.co_index.get(name) or {'count':0,'mains':set(),'ss_name':'','hindex':'','papers':'','ss_id':'','flagged': False}
+            meta['ss_name'] = details.get('name') if details else top.get('name','')
+            meta['hindex'] = details.get('hIndex','') if details else ''
+            meta['papers'] = details.get('paperCount','') if details else ''
+            meta['ss_id'] = author_id or ''
+            # only update co_index (do NOT add to self.rows)
+            self.co_index[name] = meta
+            if meta.get('flagged'):
+                self.watchlist[name] = {'type':'Co-author','ss_name':meta.get('ss_name',''),'hindex':meta.get('hindex',''),'papers':meta.get('papers',''),'ss_id':meta.get('ss_id','')}
+                su.cache['watchlist'] = self.watchlist; su.save_cache()
+        self.root.after(10, lambda: self.set_co_status("Enrichment complete"))
 
     def enrich_specific_coauthor(self, name):
-        self._enrich_coauthor_names([name])
-        self.notebook.select(self.co_frame)
+        self.threaded_enrich_specific_coauthor(name)
 
     def export_coauthors_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
@@ -632,7 +787,6 @@ class HIndexApp:
                 w.writerow([name, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''), mains, meta['count']])
         messagebox.showinfo("Saved", f"Saved {len(self.co_index)} co-authors to {path}.")
 
-# Main
 if __name__ == '__main__':
     root = tk.Tk()
     app = HIndexApp(root)
