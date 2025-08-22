@@ -1,17 +1,28 @@
 """
-zotero_hindex_viewer_with_coauthors.py
-Patched version of the Zotero -> Semantic Scholar h-index viewer that
-- fixes fields issues (no unsupported fields for search/details)
-- robustly retries when fields are unsupported
-- adds a dedicated "Co-authors" tab that lists coauthors and their linkages
+HIndex_Viewer_v3.py
 
-Usage:
- - Requires: Python 3.8+, `requests` package (`pip install requests`)
- - Run: `py zotero_hindex_viewer_with_coauthors.py` or `python zotero_hindex_viewer_with_coauthors.py`
+Upgraded version (v3) of the Zotero -> Semantic Scholar H-index viewer.
+Main new features requested:
+
+1) On startup: if `ss_author_cache.json` exists it is loaded and used to autopopulate the Authors table
+   (search:: and author:: cache entries are interpreted to pre-fill fields).
+
+2) When importing a CSV, new names are added but existing names / information are NOT overwritten.
+   Import is case-insensitive and will skip names already present in the Authors table.
+
+3) The Co-authors tab now shows the same Semantic Scholar fields as the Authors tab
+   (SS Name, H-index, papers, SSid) for each co-author. Co-author details are taken from cache
+   when available; if many coauthors are present the app asks before making many API calls.
+
+Requirements: Python 3.8+, requests. Install with:
+    py -m pip install --user requests
+
+Run:
+    py HIndex_Viewer_v3.py
 
 Notes:
- - If you previously had ss_author_cache.json, delete it to avoid stale cached failures.
- - Provide an API key (optional but recommended) in the API key box of the GUI to reduce rate limits.
+ - Cache file: ss_author_cache.json in the same folder. Delete it to force fresh queries.
+ - Use the API key box if you have a Semantic Scholar API key to increase rate limits.
 
 """
 
@@ -21,83 +32,37 @@ import requests, time, json, csv, re, os, webbrowser
 from urllib.parse import quote_plus
 
 # -----------------------
-# Config
+# Configuration
 SS_BASE = "https://api.semanticscholar.org/graph/v1"
-# fields used for author search (do NOT include 'aliases' here)
 SS_AUTHOR_FIELDS = "name,affiliations,hIndex,paperCount"
-# cache filename
 CACHE_FILE = "ss_author_cache.json"
-# polite delay between requests
-DEFAULT_DELAY = 2.0
+DEFAULT_DELAY = 3.0  # seconds — increased default to reduce 429s
 
 # -----------------------
-# Simple cache helpers
+# Cache helpers
+
 def load_cache():
     if os.path.exists(CACHE_FILE):
         try:
-            return json.load(open(CACHE_FILE, "r", encoding="utf8"))
-        except Exception:
+            with open(CACHE_FILE, 'r', encoding='utf8') as f:
+                return json.load(f)
+        except Exception as e:
+            print("Failed to load cache:", e)
             return {}
     return {}
 
+
 def save_cache(cache):
     try:
-        json.dump(cache, open(CACHE_FILE, "w", encoding="utf8"), indent=2)
+        with open(CACHE_FILE, 'w', encoding='utf8') as f:
+            json.dump(cache, f, indent=2)
     except Exception as e:
         print("Failed to save cache:", e)
 
 # -----------------------
-# Zotero parsers
+# HTTP helper with retries/backoff
 
-def parse_zotero_csv(path):
-    names = set()
-    with open(path, newline='', encoding='utf8', errors='ignore') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            for key in ['Creators', 'Creator', 'Authors', 'Author', 'author']:
-                if key in row and row[key]:
-                    text = row[key]
-                    parts = re.split(r';|\band\b', text)
-                    for p in parts:
-                        p = p.strip()
-                        if not p: continue
-                        if ',' in p:
-                            last, first = [x.strip() for x in p.split(',',1)]
-                            name = f"{first} {last}"
-                        else:
-                            name = p
-                        names.add(name)
-                    break
-    return sorted(names)
-
-def parse_bibtex_authors(path):
-    names = set()
-    txt = open(path, encoding='utf8', errors='ignore').read()
-    for m in re.finditer(r'author\s*=\s*\{([^}]*)\}', txt, flags=re.I | re.S):
-        authors_field = m.group(1)
-        parts = [p.strip() for p in re.split(r'\s+and\s+', authors_field)]
-        for p in parts:
-            if ',' in p:
-                last, first = [x.strip() for x in p.split(',',1)]
-                name = f"{first} {last}"
-            else:
-                name = p
-            if name:
-                names.add(name)
-    return sorted(names)
-
-# -----------------------
-# Semantic Scholar helpers (robust)
-
-# ---------- safe HTTP GET with retries/backoff ----------
 def safe_get(url, headers=None, base_delay=DEFAULT_DELAY, max_retries=6):
-    """
-    Perform a GET with retries. Handles:
-      - 429: exponential backoff (base_delay * 2^attempt + 1)
-      - transient 5xx: exponential backoff (base_delay * 2^attempt)
-    Returns the requests.Response on any non-retryable response or on 200.
-    Returns None if a network exception occurs.
-    """
     headers = headers or {}
     last_resp = None
     for attempt in range(max_retries):
@@ -107,196 +72,171 @@ def safe_get(url, headers=None, base_delay=DEFAULT_DELAY, max_retries=6):
             print(f"[safe_get] Network exception for {url}: {e}")
             return None
         last_resp = resp
-        # success
         if resp.status_code == 200:
             return resp
-        # rate limit -> wait and retry
         if resp.status_code == 429:
             wait = base_delay * (2 ** attempt) + 1.0
             print(f"[safe_get] 429 received. Waiting {wait:.1f}s before retry {attempt+1}/{max_retries}...")
             time.sleep(wait)
             continue
-        # transient server errors -> retry
         if resp.status_code in (500, 502, 503, 504):
             wait = base_delay * (2 ** attempt)
             print(f"[safe_get] Server {resp.status_code}. Waiting {wait:.1f}s before retry {attempt+1}/{max_retries}...")
             time.sleep(wait)
             continue
-        # other non-200 -> return it so caller can inspect body/status
         return resp
-    # exhausted retries; return last response (could be 429/5xx)
     return last_resp
 
+# -----------------------
+# Semantic Scholar helpers
 
-# ---------- search author (uses safe_get) ----------
-def ss_search_author(name, api_key=None):
+def ss_search_author(name, api_key=None, base_delay=DEFAULT_DELAY):
     cache_key = f"search::{name}"
     if cache_key in cache:
         return cache[cache_key]
-
     q = quote_plus(name)
     url = f"{SS_BASE}/author/search?query={q}&fields={quote_plus(SS_AUTHOR_FIELDS)}&limit=5"
     headers = {}
     if api_key:
         headers['x-api-key'] = api_key
-
-    r = safe_get(url, headers=headers, base_delay=float(getattr(app, 'delay_var', DEFAULT_DELAY).get() if 'app' in globals() else DEFAULT_DELAY))
+    r = safe_get(url, headers=headers, base_delay=base_delay)
     if r is None:
-        print(f"[ss_search_author] Request failed for '{name}' (network error).")
+        print(f"[ss_search_author] Network fail for '{name}'")
         return None
     if r.status_code != 200:
-        print(f"[ss_search_author] Non-200 status for '{name}': {r.status_code}")
+        print(f"[ss_search_author] Non-200 for '{name}': {r.status_code}")
         try:
-            print("Response text (truncated):", r.text[:2000])
+            print(r.text[:1000])
         except Exception:
             pass
         return None
-
     try:
         j = r.json()
     except Exception as e:
-        print(f"[ss_search_author] Failed parsing JSON for '{name}': {e}")
-        print("Raw text (truncated):", r.text[:2000])
+        print(f"[ss_search_author] JSON parse failed for '{name}': {e}")
         return None
-
     data = j.get('data', [])
     top = data[0] if data else None
     cache[cache_key] = top
     save_cache(cache)
     return top
 
-# ---------- get author details (with same backoff behavior) ----------
-def ss_get_author_details(author_id, api_key=None, fields="name,hIndex,paperCount"):
+
+def ss_get_author_details(author_id, api_key=None, fields="name,hIndex,paperCount", base_delay=DEFAULT_DELAY):
     if not author_id:
         return None
     cache_key = f"author::{author_id}"
     if cache_key in cache:
         return cache[cache_key]
-
     headers = {}
     if api_key:
         headers['x-api-key'] = api_key
-
     tried_fields = fields
-    for attempt in range(2):
+    for _ in range(2):
         url = f"{SS_BASE}/author/{author_id}?fields={quote_plus(tried_fields)}"
-        r = safe_get(url, headers=headers, base_delay=float(getattr(app, 'delay_var', DEFAULT_DELAY).get() if 'app' in globals() else DEFAULT_DELAY))
+        r = safe_get(url, headers=headers, base_delay=base_delay)
         if r is None:
-            print(f"[ss_get_author_details] Request exception for id '{author_id}'.")
+            print(f"[ss_get_author_details] Network fail for id {author_id}")
             return None
-
         if r.status_code == 200:
             try:
                 j = r.json()
             except Exception as e:
-                print(f"[ss_get_author_details] JSON parse failed for id '{author_id}': {e}")
-                print("Raw text (truncated):", r.text[:2000])
+                print(f"[ss_get_author_details] JSON parse failed for id {author_id}: {e}")
                 return None
             cache[cache_key] = j
             save_cache(cache)
             return j
-
         if r.status_code == 400 and 'Unrecognized or unsupported fields' in r.text and 'aliases' in tried_fields:
-            print(f"[ss_get_author_details] 400 for id '{author_id}' with fields '{tried_fields}' — retrying without 'aliases'")
             tried_fields = ",".join([f for f in tried_fields.split(",") if f.strip().lower() != 'aliases'])
             continue
-
-        # If it's a rate-limit or other non-200, safe_get already retried — just print and return None/signal
-        print(f"[ss_get_author_details] Non-200 status for id '{author_id}': {r.status_code}")
+        print(f"[ss_get_author_details] Non-200 for id {author_id}: {r.status_code}")
         try:
-            print("Response text (truncated):", r.text[:2000])
+            print(r.text[:1000])
         except Exception:
             pass
         return None
-
     return None
 
 
-# ---------- get coauthors (uses safe_get too) ----------
-def ss_get_author_coauthors(author_id, api_key=None, max_papers=50):
+def ss_get_author_coauthors(author_id, api_key=None, max_papers=50, base_delay=DEFAULT_DELAY):
     if not author_id:
         return {}
-
     cache_key = f"coauthors::{author_id}"
     if cache_key in cache:
         return cache[cache_key]
-
     headers = {}
     if api_key:
         headers['x-api-key'] = api_key
-
-
     url = f"{SS_BASE}/author/{author_id}/papers?fields=title,authors&limit={max_papers}"
-
-
-    # Use the configured delay variable if available, otherwise default
-    base_delay = float(getattr(app, 'delay_var', DEFAULT_DELAY).get() if 'app' in globals() else DEFAULT_DELAY)
     r = safe_get(url, headers=headers, base_delay=base_delay)
-
-
     if r is None:
-        print(f"[ss_get_author_coauthors] Request failed for id '{author_id}' (network error).")
+        print(f"[ss_get_author_coauthors] Network fail for id {author_id}")
         return {}
-
-
     if r.status_code != 200:
-        print(f"[ss_get_author_coauthors] Non-200 status for id '{author_id}': {r.status_code}")
+        print(f"[ss_get_author_coauthors] Non-200 for id {author_id}: {r.status_code}")
         try:
-            print("Response text (truncated):", r.text[:2000])
+            print(r.text[:1000])
         except Exception:
             pass
         return {}
-
-
     try:
         j = r.json()
     except Exception as e:
-        print(f"[ss_get_author_coauthors] JSON parse failed for id '{author_id}': {e}")
+        print(f"[ss_get_author_coauthors] JSON parse failed for id {author_id}: {e}")
         return {}
-
-
     co_counts = {}
     papers = j.get('data', []) if isinstance(j, dict) else []
-
-
     for p in papers:
         for a in p.get('authors', []) or []:
             name = a.get('name') or a.get('authorName') or None
             if not name:
                 continue
             co_counts[name] = co_counts.get(name, 0) + 1
-
-
     cache[cache_key] = co_counts
     save_cache(cache)
     return co_counts
+
 # -----------------------
-# GUI Application with two tabs: Authors and Co-authors
-class App:
+# GUI
+class HIndexApp:
     def __init__(self, root):
         self.root = root
-        root.title("Zotero → SemanticScholar h-index + Coauthors")
+        root.title("HIndex Viewer v3 — Zotero → Semantic Scholar")
         self.api_key_var = tk.StringVar(value="")
         self.delay_var = tk.DoubleVar(value=DEFAULT_DELAY)
 
-        # Notebook for tabs
+        # Notebook
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True)
 
-        # --- Authors tab ---
+        # Authors tab
         self.auth_frame = tk.Frame(self.notebook)
         self.notebook.add(self.auth_frame, text="Authors")
+        self._build_authors_tab()
 
-        # controls row
+        # Coauthors tab
+        self.co_frame = tk.Frame(self.notebook)
+        self.notebook.add(self.co_frame, text="Co-authors")
+        self._build_coauthors_tab()
+
+        # Data
+        self.rows = []  # list of dicts for main authors
+        self.co_index = {}  # coauthor_name -> metadata dict
+
+        # Populate from cache on start
+        self.load_cache_on_startup()
+
+    # ---------- UI builders ----------
+    def _build_authors_tab(self):
         frm = tk.Frame(self.auth_frame)
         frm.pack(fill='x', padx=6, pady=6)
         tk.Button(frm, text="Load Zotero CSV", command=self.load_csv).pack(side='left')
         tk.Button(frm, text="Load Zotero BibTeX", command=self.load_bib).pack(side='left')
-        tk.Button(frm, text="Fetch from Zotero API (opt)", command=self.fetch_zotero_api).pack(side='left')
+        tk.Button(frm, text="Fetch Zotero API (opt)", command=self.fetch_zotero_api).pack(side='left')
         tk.Button(frm, text="Refresh Selected", command=self.refresh_selected).pack(side='left')
         tk.Button(frm, text="Refresh All", command=self.refresh_all).pack(side='left')
         tk.Button(frm, text="Export CSV", command=self.export_csv).pack(side='left')
-
         rightfrm = tk.Frame(frm)
         rightfrm.pack(side='right')
         tk.Label(rightfrm, text="API key (opt):").pack(side='left')
@@ -304,78 +244,126 @@ class App:
         tk.Label(rightfrm, text="Delay(s):").pack(side='left', padx=(8,0))
         tk.Entry(rightfrm, textvariable=self.delay_var, width=4).pack(side='left')
 
-        # search box
         sfrm = tk.Frame(self.auth_frame)
         sfrm.pack(fill='x', padx=6)
         tk.Label(sfrm, text="Filter:").pack(side='left')
         self.filter_var = tk.StringVar()
-        e = tk.Entry(sfrm, textvariable=self.filter_var)
-        e.pack(side='left', fill='x', expand=True)
+        tk.Entry(sfrm, textvariable=self.filter_var).pack(side='left', fill='x', expand=True)
         self.filter_var.trace_add('write', lambda *_: self.apply_filter())
 
-        # authors treeview
-        cols = ("zotero_name","ss_name","hindex","papers","ss_id","coauthors")
+        cols = ("zotero_name","ss_name","hindex","papers","ss_id","coauthors_preview")
         self.tree = ttk.Treeview(self.auth_frame, columns=cols, show='headings')
         for c in cols:
             self.tree.heading(c, text=c.replace('_',' ').title(), command=lambda _c=c: self.sort_by(_c, False))
-            self.tree.column(c, width=150, anchor='w')
+            self.tree.column(c, width=160, anchor='w')
         self.tree.pack(fill='both', expand=True, padx=6, pady=6)
         self.tree.bind("<Button-3>", self.on_right_click)
 
         self.status = tk.Label(self.auth_frame, text="Ready", anchor='w')
         self.status.pack(fill='x')
 
-        # --- Coauthors tab ---
-        self.co_frame = tk.Frame(self.notebook)
-        self.notebook.add(self.co_frame, text="Co-authors")
-
+    def _build_coauthors_tab(self):
         cfrm = tk.Frame(self.co_frame)
         cfrm.pack(fill='x', padx=6, pady=6)
         tk.Button(cfrm, text="Build/Refresh Co-authors", command=self.build_coauthor_index).pack(side='left')
+        tk.Button(cfrm, text="Enrich coauthors (fetch SS details)", command=self.enrich_coauthors_with_ss).pack(side='left')
         tk.Button(cfrm, text="Export Coauthors CSV", command=self.export_coauthors_csv).pack(side='left')
-        tk.Button(cfrm, text="Open Main Tab", command=lambda: self.notebook.select(self.auth_frame)).pack(side='left')
+        tk.Button(cfrm, text="Open Authors Tab", command=lambda: self.notebook.select(self.auth_frame)).pack(side='left')
 
-        # coauthors treeview
-        ccols = ("coauthor_name","main_authors","count")
+        ccols = ("coauthor_name","ss_name","hindex","papers","ss_id","mains","count")
         self.ctree = ttk.Treeview(self.co_frame, columns=ccols, show='headings')
         for c in ccols:
             self.ctree.heading(c, text=c.replace('_',' ').title(), command=lambda _c=c: self.sort_co_by(_c, False))
-            self.ctree.column(c, width=200, anchor='w')
+            self.ctree.column(c, width=160, anchor='w')
         self.ctree.pack(fill='both', expand=True, padx=6, pady=6)
 
         self.co_status = tk.Label(self.co_frame, text="Co-authors ready", anchor='w')
         self.co_status.pack(fill='x')
 
-        # data
-        self.rows = []  # list of main author dicts
-        self.co_index = {}  # coauthor_name -> {count: int, mains: set()}
-
-    def set_status(self, s):
-        self.status.config(text=s)
+    # ---------- Utility UI methods ----------
+    def set_status(self, text):
+        self.status.config(text=text)
         self.root.update_idletasks()
 
-    def set_co_status(self, s):
-        self.co_status.config(text=s)
+    def set_co_status(self, text):
+        self.co_status.config(text=text)
         self.root.update_idletasks()
 
-    # ----------------- Loading Zotero inputs
+    # ---------- Startup cache import ----------
+    def load_cache_on_startup(self):
+        # Use global cache loaded at module start
+        # Build rows from any existing search:: entries in cache
+        imported = 0
+        for key, val in cache.items():
+            if not key.startswith('search::'):
+                continue
+            zotero_name = key.split('search::',1)[1]
+            top = val
+            if not top:
+                continue
+            author_id = top.get('authorId')
+            # Try to get author details from cache (author::id)
+            details = None
+            if author_id and f'author::{author_id}' in cache:
+                details = cache.get(f'author::{author_id}')
+            # Build row dict
+            row = {
+                'zotero_name': zotero_name,
+                'ss_name': (details.get('name') if details else top.get('name')) if top else '',
+                'hindex': (details.get('hIndex') if details else '') if details or top else '',
+                'papers': (details.get('paperCount') if details else '') if details or top else '',
+                'ss_id': author_id or '',
+                'coauthors_list': cache.get(f'coauthors::{author_id}') if author_id else {},
+            }
+            # Avoid duplicates
+            if not any(r['zotero_name'].lower() == row['zotero_name'].lower() for r in self.rows):
+                self.rows.append(row)
+                imported += 1
+        if imported:
+            self.refresh_tree()
+            self.set_status(f"Loaded {imported} authors from cache")
+        else:
+            self.set_status("Ready (no cached authors found)")
+
+    # ---------- Zotero importers ----------
     def load_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV files","*.csv"),("All files","*.*")])
-        if not path: return
+        if not path:
+            return
         names = parse_zotero_csv(path)
         if not names:
-            messagebox.showinfo("No authors", "No authors found in that CSV (looked for 'Creators'/'Author' columns).")
+            messagebox.showinfo("No authors","No authors found in that CSV.")
             return
-        self.populate_names(names)
+        self.import_names_safely(names)
 
     def load_bib(self):
         path = filedialog.askopenfilename(filetypes=[("BibTeX files","*.bib"),("All files","*.*")])
-        if not path: return
+        if not path:
+            return
         names = parse_bibtex_authors(path)
         if not names:
-            messagebox.showinfo("No authors", "No authors found in that BibTeX.")
+            messagebox.showinfo("No authors","No authors found in that BibTeX.")
             return
-        self.populate_names(names)
+        self.import_names_safely(names)
+
+    def import_names_safely(self, names):
+        # Add only names that don't already exist (case-insensitive)
+        existing = {r['zotero_name'].lower(): r for r in self.rows}
+        added = 0
+        for n in names:
+            if n.lower() in existing:
+                continue
+            self.rows.append({
+                'zotero_name': n,
+                'ss_name': '',
+                'hindex': '',
+                'papers': '',
+                'ss_id': '',
+                'coauthors_list': {},
+            })
+            added += 1
+        self.refresh_tree()
+        messagebox.showinfo("Import complete", f"Imported {added} new names (skipped {len(names)-added} existing)")
 
     def fetch_zotero_api(self):
         dlg = tk.Toplevel(self.root)
@@ -425,34 +413,21 @@ class App:
                     if len(items) < params['limit']: break
                 dlg.destroy()
                 if names:
-                    self.populate_names(sorted(names))
+                    self.import_names_safely(sorted(names))
                 else:
                     messagebox.showinfo("No authors", "No author names found in Zotero items.")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
             finally:
                 self.set_status("Ready")
-
         tk.Button(dlg, text="Fetch", command=go).pack()
 
-    def populate_names(self, names):
-        self.rows = []
-        for n in names:
-            self.rows.append({
-                "zotero_name": n,
-                "ss_name": "",
-                "hindex": "",
-                "papers": "",
-                "ss_id": "",
-                "coauthors": "",
-                "coauthors_list": {}
-            })
-        self.refresh_tree()
-
+    # ---------- Tree helpers ----------
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         for r in self.rows:
-            vals = (r['zotero_name'], r['ss_name'], r['hindex'], r['papers'], r['ss_id'], r['coauthors'])
+            preview = ", ".join(sorted(list((r.get('coauthors_list') or {}).keys())[:6]))
+            vals = (r.get('zotero_name',''), r.get('ss_name',''), r.get('hindex',''), r.get('papers',''), r.get('ss_id',''), preview)
             self.tree.insert('', 'end', values=vals)
         self.apply_filter()
 
@@ -498,36 +473,33 @@ class App:
         vals = self.tree.item(iid)['values']
         ss_id = vals[4]
         if not ss_id:
-            messagebox.showinfo("No SS id", "No Semantic Scholar ID for this row.")
+            messagebox.showinfo("No SS id","No Semantic Scholar ID for this row.")
             return
         webbrowser.open(f"https://www.semanticscholar.org/author/{ss_id}")
 
-    # ----------------- Refreshing logic
+    # ---------- Refresh logic ----------
     def refresh_item(self, iid):
         vals = self.tree.item(iid)['values']
         zotero_name = vals[0]
         self.set_status(f"Searching {zotero_name}...")
         api_key = self.api_key_var.get().strip() or None
-        top = ss_search_author(zotero_name, api_key=api_key)
-        time.sleep(self.delay_var.get())
+        base_delay = float(self.delay_var.get() or DEFAULT_DELAY)
+        top = ss_search_author(zotero_name, api_key=api_key, base_delay=base_delay)
+        time.sleep(base_delay)
         if not top:
             messagebox.showinfo("No match", f"No Semantic Scholar match for {zotero_name}")
             self.set_status("Ready")
             return
         author_id = top.get('authorId')
-        details = ss_get_author_details(author_id, api_key=api_key, fields="name,hIndex,paperCount")
-        coauthors = ss_get_author_coauthors(author_id, api_key=api_key, max_papers=50)
-
+        details = ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
+        coauthors = ss_get_author_coauthors(author_id, api_key=api_key, max_papers=50, base_delay=base_delay)
         for r in self.rows:
-            if r['zotero_name'] == zotero_name:
-                r['ss_name'] = details.get('name') if details else top.get('name', '')
+            if r['zotero_name'].lower() == zotero_name.lower():
+                r['ss_name'] = (details.get('name') if details else top.get('name',''))
                 r['hindex'] = details.get('hIndex','') if details else ''
                 r['papers'] = details.get('paperCount','') if details else ''
                 r['ss_id'] = author_id or ''
-                # store coauthor dict
                 r['coauthors_list'] = coauthors or {}
-                # make a short string preview
-                r['coauthors'] = ", ".join(sorted(list((coauthors or {}).keys())[:6]))
                 break
         self.refresh_tree()
         self.set_status("Ready")
@@ -535,39 +507,38 @@ class App:
     def refresh_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Select row", "Select a row first (click it) to refresh.")
+            messagebox.showinfo("Select row","Select a row first (click it) to refresh.")
             return
         for iid in sel:
             self.refresh_item(iid)
 
     def refresh_all(self):
         api_key = self.api_key_var.get().strip() or None
-        delay = float(self.delay_var.get() or DEFAULT_DELAY)
+        base_delay = float(self.delay_var.get() or DEFAULT_DELAY)
         n = len(self.rows)
         if n == 0:
-            messagebox.showinfo("No rows", "Load some authors first.")
+            messagebox.showinfo("No rows","Load some authors first.")
             return
         if n > 80:
             if not messagebox.askyesno("Many authors", f"You are about to query {n} authors. This may hit API rate limits. Continue?"):
                 return
         for i, r in enumerate(self.rows, start=1):
             self.set_status(f"({i}/{n}) Searching: {r['zotero_name']}")
-            top = ss_search_author(r['zotero_name'], api_key=api_key)
-            time.sleep(delay)
+            top = ss_search_author(r['zotero_name'], api_key=api_key, base_delay=base_delay)
+            time.sleep(base_delay)
             if not top:
                 continue
             author_id = top.get('authorId')
-            details = ss_get_author_details(author_id, api_key=api_key, fields="name,hIndex,paperCount")
-            coauthors = ss_get_author_coauthors(author_id, api_key=api_key, max_papers=50)
-            r['ss_name'] = details.get('name') if details else top.get('name','')
+            details = ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
+            coauthors = ss_get_author_coauthors(author_id, api_key=api_key, max_papers=50, base_delay=base_delay)
+            r['ss_name'] = (details.get('name') if details else top.get('name',''))
             r['hindex'] = details.get('hIndex','') if details else ''
             r['papers'] = details.get('paperCount','') if details else ''
             r['ss_id'] = author_id or ''
             r['coauthors_list'] = coauthors or {}
-            r['coauthors'] = ", ".join(sorted(list((coauthors or {}).keys())[:6]))
             self.refresh_tree()
         self.set_status("Ready")
-        # after updating main authors, also rebuild coauthor index automatically
+        # rebuild coauthor index
         self.build_coauthor_index()
 
     def export_csv(self):
@@ -581,64 +552,124 @@ class App:
                 w.writerow(row_out)
         messagebox.showinfo("Saved", f"Saved {len(self.rows)} rows to {path}.")
 
-    # ----------------- Coauthor aggregation
+    # ---------- Coauthor aggregation & enrichment ----------
     def build_coauthor_index(self):
-        """
-        Build an aggregated index of coauthors across all main authors
-        and populate the coauthors treeview.
-        """
         self.co_index = {}
-        api_key = self.api_key_var.get().strip() or None
-        # aggregate from cached coauthors in rows; if a row has no coauthors_list, try to fetch
         total = len(self.rows)
         for i, r in enumerate(self.rows, start=1):
             self.set_co_status(f"({i}/{total}) Collecting coauthors for: {r['zotero_name']}")
-            if not r.get('coauthors_list'):
-                # try to fetch
-                if r.get('ss_id'):
-                    co = ss_get_author_coauthors(r['ss_id'], api_key=api_key, max_papers=50)
-                    r['coauthors_list'] = co or {}
-                else:
-                    # try searching for the author first
-                    top = ss_search_author(r['zotero_name'], api_key=api_key)
-                    time.sleep(self.delay_var.get())
-                    if top and top.get('authorId'):
-                        r['ss_id'] = top.get('authorId')
-                        details = ss_get_author_details(r['ss_id'], api_key=api_key, fields="name,hIndex,paperCount")
-                        r['ss_name'] = details.get('name') if details else top.get('name','')
-                        co = ss_get_author_coauthors(r['ss_id'], api_key=api_key, max_papers=50)
-                        r['coauthors_list'] = co or {}
-            # merge
+            if not r.get('coauthors_list') and r.get('ss_id'):
+                # try fetch if missing
+                base_delay = float(self.delay_var.get() or DEFAULT_DELAY)
+                co = ss_get_author_coauthors(r['ss_id'], api_key=self.api_key_var.get().strip() or None, max_papers=50, base_delay=base_delay)
+                r['coauthors_list'] = co or {}
             for co_name, cnt in (r.get('coauthors_list') or {}).items():
                 if not co_name: continue
                 if co_name == r.get('ss_name'):
                     continue
-                entry = self.co_index.get(co_name, {'count':0, 'mains':set()})
+                entry = self.co_index.get(co_name, {'count':0, 'mains':set(), 'ss_name':'', 'hindex':'', 'papers':'', 'ss_id':''})
                 entry['count'] += cnt
                 entry['mains'].add(r['zotero_name'])
                 self.co_index[co_name] = entry
-        # populate ctree
+        # populate ctree (basic, without SS details yet)
         self.ctree.delete(*self.ctree.get_children())
         for name, meta in sorted(self.co_index.items(), key=lambda x: -x[1]['count']):
             mains = ", ".join(sorted(meta['mains']))
-            self.ctree.insert('', 'end', values=(name, mains, meta['count']))
+            vals = (name, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''), mains, meta['count'])
+            self.ctree.insert('', 'end', values=vals)
         self.set_co_status(f"Built co-author index: {len(self.co_index)} co-authors")
+
+    def enrich_coauthors_with_ss(self):
+        # Enrich coauthors with Semantic Scholar search/details, using cache when possible.
+        missing = [name for name,meta in self.co_index.items() if not meta.get('ss_id')]
+        if not missing:
+            messagebox.showinfo("Nothing to do","All coauthors already have SS info in cache.")
+            return
+        if len(missing) > 60:
+            if not messagebox.askyesno("Many coauthors", f"You are about to query {len(missing)} coauthors from Semantic Scholar. This may hit rate limits. Continue?"):
+                return
+        api_key = self.api_key_var.get().strip() or None
+        base_delay = float(self.delay_var.get() or DEFAULT_DELAY)
+        for i, name in enumerate(missing, start=1):
+            self.set_co_status(f"({i}/{len(missing)}) Looking up coauthor: {name}")
+            top = ss_search_author(name, api_key=api_key, base_delay=base_delay)
+            time.sleep(base_delay)
+            if not top:
+                continue
+            author_id = top.get('authorId')
+            details = ss_get_author_details(author_id, api_key=api_key, base_delay=base_delay)
+            meta = self.co_index.get(name)
+            if meta is None:
+                continue
+            meta['ss_name'] = details.get('name') if details else top.get('name','')
+            meta['hindex'] = details.get('hIndex','') if details else ''
+            meta['papers'] = details.get('paperCount','') if details else ''
+            meta['ss_id'] = author_id or ''
+            self.co_index[name] = meta
+        # refresh ctree
+        self.ctree.delete(*self.ctree.get_children())
+        for name, meta in sorted(self.co_index.items(), key=lambda x: -x[1]['count']):
+            mains = ", ".join(sorted(meta['mains']))
+            vals = (name, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''), mains, meta['count'])
+            self.ctree.insert('', 'end', values=vals)
+        self.set_co_status("Enrichment complete")
 
     def export_coauthors_csv(self):
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
         if not path: return
         with open(path, 'w', newline='', encoding='utf8') as f:
             w = csv.writer(f)
-            w.writerow(['coauthor_name','main_authors','count'])
+            w.writerow(['coauthor_name','ss_name','hindex','papers','ss_id','main_authors','count'])
             for name, meta in sorted(self.co_index.items(), key=lambda x: -x[1]['count']):
                 mains = "; ".join(sorted(meta['mains']))
-                w.writerow([name, mains, meta['count']])
+                w.writerow([name, meta.get('ss_name',''), meta.get('hindex',''), meta.get('papers',''), meta.get('ss_id',''), mains, meta['count']])
         messagebox.showinfo("Saved", f"Saved {len(self.co_index)} co-authors to {path}.")
 
 # -----------------------
-if __name__ == "__main__":
+# Zotero parsers (same as before)
+
+def parse_zotero_csv(path):
+    names = set()
+    with open(path, newline='', encoding='utf8', errors='ignore') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key in ['Creators', 'Creator', 'Authors', 'Author', 'author']:
+                if key in row and row[key]:
+                    text = row[key]
+                    parts = re.split(r';|\band\b', text)
+                    for p in parts:
+                        p = p.strip()
+                        if not p: continue
+                        if ',' in p:
+                            last, first = [x.strip() for x in p.split(',',1)]
+                            name = f"{first} {last}"
+                        else:
+                            name = p
+                        names.add(name)
+                    break
+    return sorted(names)
+
+
+def parse_bibtex_authors(path):
+    names = set()
+    txt = open(path, encoding='utf8', errors='ignore').read()
+    for m in re.finditer(r'author\s*=\s*\{([^}]*)\}', txt, flags=re.I | re.S):
+        authors_field = m.group(1)
+        parts = [p.strip() for p in re.split(r'\s+and\s+', authors_field)]
+        for p in parts:
+            if ',' in p:
+                last, first = [x.strip() for x in p.split(',',1)]
+                name = f"{first} {last}"
+            else:
+                name = p
+            if name:
+                names.add(name)
+    return sorted(names)
+
+# -----------------------
+if __name__ == '__main__':
     cache = load_cache()
     root = tk.Tk()
-    app = App(root)
-    root.geometry("1100x650")
+    app = HIndexApp(root)
+    root.geometry('1200x700')
     root.mainloop()
